@@ -99,6 +99,9 @@ void Worker::operator()() {
         }
 
         if (matched) {
+            std::lock_guard<std::mutex> lock(outputMutex);
+            std::fprintf(outputFile, "%s\n", domain.c_str());
+            std::fflush(outputFile);
             Logger::debug("Worker: matched all words in domain %s", domain.c_str());
         } else {
             Logger::debug("Worker: not matched %s", domain.c_str());
