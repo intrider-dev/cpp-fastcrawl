@@ -14,12 +14,12 @@ class Worker {
     std::mutex* fileMutex_;
 public:
     Worker(const std::vector<std::string>& urls,
-           std::atomic<size_t>& nextIndex,
-           const std::vector<std::string>& keywords,
-           size_t initialRequests,
-           FILE* outfp,
-           std::mutex* fileMutex,
-           std::atomic<size_t>* matched);
+       std::atomic<size_t>& nextIndex,
+       const std::vector<std::string>& keywords,
+       size_t initialRequests,
+       FILE* outfp,
+       std::mutex* fileMutex,
+       std::atomic<size_t>* matched);
 
     // Entry point для std::thread
     void operator()();
@@ -35,9 +35,9 @@ public:
 
 private:
     // Вспомогалки
-    void initCurlShare();         // один раз на процесс
     void addHandle(size_t idx);   // запускаем новый easy
     void removeHandle(CURL* easy);
+    void safeRemove(CURL* easy);
 
     // Данные, переданные из HttpClient
     const std::vector<std::string>& urls_;

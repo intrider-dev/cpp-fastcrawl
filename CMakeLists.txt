@@ -28,6 +28,7 @@ add_executable(${PROJECT_NAME}
         src/HttpClient.cpp
         src/Worker.cpp
         src/Logger.cpp
+        src/CurlShare.cpp
 )
 
 # Подключаемые директории с заголовками

@@ -2,6 +2,8 @@
 #include "DomainLoader.hpp"
 #include "HttpClient.hpp"
 #include "CommonTypes.hpp"
+#include "CurlShare.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -68,6 +70,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    curl_global_init(CURL_GLOBAL_ALL);
+
+    initCurlShare();
+
     Logger::init(args.debug ? Logger::Level::Debug : Logger::Level::Info);
 
     FILE* logfp = nullptr;
@@ -122,5 +128,14 @@ int main(int argc, char* argv[]) {
     Logger::info("Total matched: %zu", matched.load());
 
     if (logfp) std::fclose(logfp);
+
+    std::call_once(g_shareCleanupOnce, [] {
+        if (g_shareHandle) {
+            curl_share_cleanup(g_shareHandle);
+            g_shareHandle = nullptr;
+        }
+    });
+
+    curl_global_cleanup();
     return 0;
 }

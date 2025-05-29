@@ -1,31 +1,17 @@
 #include "Worker.hpp"
 #include "Logger.hpp"
+#include "CurlShare.hpp"
 
 #include <sys/epoll.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
 #include <mutex>
+#include <map>
+#include <sstream>
 #include <cassert>
-#include <fstream>
-#include <memory>
 
-// Один share-handle на весь процесс
-static CURLSH*      g_shareHandle = nullptr;
-static std::once_flag g_shareFlag;
-
-// Инициализируем общий DNS-кеш
-void Worker::initCurlShare() {
-    std::call_once(g_shareFlag, []() {
-        g_shareHandle = curl_share_init();
-        if (!g_shareHandle) {
-            Logger::warn("Worker: curl_share_init failed");
-            return;
-        }
-        curl_share_setopt(g_shareHandle, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
-    });
-}
-
+// Конструктор
 Worker::Worker(const std::vector<std::string>& urls,
                std::atomic<size_t>& nextIndex,
                const std::vector<std::string>& keywords,
@@ -33,53 +19,53 @@ Worker::Worker(const std::vector<std::string>& urls,
                FILE* outfp,
                std::mutex* fileMutex,
                std::atomic<size_t>* matched)
-  : urls_(urls)
-  , nextIndex_(nextIndex)
-  , keywords_(keywords)
-  , initialRequests_(initialRequests)
-  , multi_(nullptr)
-  , epfd_(-1)
-  , timer_ms_(-1)
-  , outfp_(outfp)
-  , fileMutex_(fileMutex)
-  , matched_(matched)
+    : urls_(urls),
+      nextIndex_(nextIndex),
+      keywords_(keywords),
+      initialRequests_(initialRequests),
+      multi_(nullptr),
+      epfd_(-1),
+      timer_ms_(-1),
+      outfp_(outfp),
+      fileMutex_(fileMutex),
+      matched_(matched)
 {}
 
+// Callback для записи тела ответа
 size_t Worker::writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* ctx = static_cast<EasyContext*>(userdata);
     ctx->html.append(ptr, size * nmemb);
     return size * nmemb;
 }
 
-int Worker::curlSocketCallback(CURL* easy, curl_socket_t s, int what, void* userp, void* sockp) {
+// Callback для интеграции с epoll
+int Worker::curlSocketCallback(CURL* /*easy*/, curl_socket_t s, int what, void* userp, void* /*sockp*/) {
     auto* self = static_cast<Worker*>(userp);
-    struct epoll_event ev;
+    epoll_event ev{};
     ev.data.fd = s;
 
     uint32_t events = 0;
     switch (what) {
-        case CURL_POLL_IN:  events = EPOLLIN; break;
-        case CURL_POLL_OUT: events = EPOLLOUT; break;
-        case CURL_POLL_INOUT: events = EPOLLIN | EPOLLOUT; break;
+        case CURL_POLL_IN:    events = EPOLLIN;             break;
+        case CURL_POLL_OUT:   events = EPOLLOUT;            break;
+        case CURL_POLL_INOUT: events = EPOLLIN | EPOLLOUT;  break;
         case CURL_POLL_REMOVE:
             epoll_ctl(self->epfd_, EPOLL_CTL_DEL, s, nullptr);
             self->sockFlags_.erase(s);
             return 0;
-        default: return 0;
+        default:
+            return 0;
     }
-
     ev.events = events | EPOLLET;
 
     auto it = self->sockFlags_.find(s);
     if (it == self->sockFlags_.end()) {
-        // сокет не зарегистрирован — добавляем
         if (epoll_ctl(self->epfd_, EPOLL_CTL_ADD, s, &ev) == -1) {
             Logger::warn("Worker: epoll_ctl ADD failed: %s", strerror(errno));
         } else {
             self->sockFlags_[s] = events;
         }
     } else {
-        // сокет уже есть — модифицируем
         if (epoll_ctl(self->epfd_, EPOLL_CTL_MOD, s, &ev) == -1) {
             Logger::warn("Worker: epoll_ctl MOD failed: %s", strerror(errno));
         } else {
@@ -91,14 +77,21 @@ int Worker::curlSocketCallback(CURL* easy, curl_socket_t s, int what, void* user
     return 0;
 }
 
+// Callback для таймера
 int Worker::timerCb(CURLM* /*multi*/, long timeout_ms, void* userp) {
-    Worker* self = static_cast<Worker*>(userp);
+    auto* self = static_cast<Worker*>(userp);
     self->timer_ms_ = timeout_ms;
     return 0;
 }
 
+// Добавить новый easy-handle
 void Worker::addHandle(size_t idx) {
-    const std::string& url = urls_[idx];
+    if (idx >= urls_.size()) {
+        Logger::warn("Worker: out-of-bounds index: %zu", idx);
+        return;
+    }
+
+    const auto& url = urls_[idx];
     CURL* easy = curl_easy_init();
     if (!easy) {
         Logger::warn("Worker: curl_easy_init failed for %s", url.c_str());
@@ -107,68 +100,91 @@ void Worker::addHandle(size_t idx) {
     auto* ctx = new EasyContext{url, "", 0L};
     ctxMap_[easy] = ctx;
 
-    curl_easy_setopt(easy, CURLOPT_URL,            url.c_str());
+    curl_easy_setopt(easy, CURLOPT_URL,            ctx->url.c_str());
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION,  writeCallback);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA,      ctx);
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(easy, CURLOPT_TIMEOUT,        20L);
-    curl_easy_setopt(easy, CURLOPT_NOSIGNAL,       1L);
-    if (g_shareHandle) // общий DNS
+    curl_easy_setopt(easy, CURLOPT_TIMEOUT,        60L);
+    curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(easy, CURLOPT_NOSIGNAL,       1L); // fix: должно быть 1L (булево!)
+    if (g_shareHandle)
         curl_easy_setopt(easy, CURLOPT_SHARE, g_shareHandle);
 
     curl_multi_add_handle(multi_, easy);
 }
 
-void Worker::removeHandle(CURL* easy) {
+// Безопасно удалить easy-handle (гарантирует отсутствие double-free)
+void Worker::safeRemove(CURL* easy) {
     curl_multi_remove_handle(multi_, easy);
+
+    auto it = ctxMap_.find(easy);
+    if (it != ctxMap_.end()) {
+        delete it->second;
+        ctxMap_.erase(it);
+    }
+
     curl_easy_cleanup(easy);
 }
 
+// Главный оператор — выполняется в потоке
 void Worker::operator()() {
     initCurlShare();
 
-    // 1) создаём multi
+    if (Logger::isDebug()) {
+        std::ostringstream oss;
+        oss << "Worker: matchWords = [";
+        for (size_t i = 0; i < keywords_.size(); ++i) {
+            if (i) oss << ", ";
+            oss << keywords_[i];
+        }
+        oss << "]";
+        Logger::debug("%s", oss.str().c_str());
+    }
+
+    // 1) Инициализация multi
     multi_ = curl_multi_init();
     if (!multi_) {
         Logger::warn("Worker: curl_multi_init failed");
         return;
     }
-    curl_multi_setopt(multi_, CURLMOPT_PIPELINING,      CURLPIPE_MULTIPLEX);
-    curl_multi_setopt(multi_, CURLMOPT_SOCKETFUNCTION,  curlSocketCallback);
-    curl_multi_setopt(multi_, CURLMOPT_SOCKETDATA,      this);
-    curl_multi_setopt(multi_, CURLMOPT_TIMERFUNCTION,   timerCb);
-    curl_multi_setopt(multi_, CURLMOPT_TIMERDATA,       this);
 
-    // 2) создаём epoll
+    curl_multi_setopt(multi_, CURLMOPT_PIPELINING,     CURLPIPE_MULTIPLEX);
+    curl_multi_setopt(multi_, CURLMOPT_SOCKETFUNCTION, curlSocketCallback);
+    curl_multi_setopt(multi_, CURLMOPT_SOCKETDATA,     this);
+    curl_multi_setopt(multi_, CURLMOPT_TIMERFUNCTION,  timerCb);
+    curl_multi_setopt(multi_, CURLMOPT_TIMERDATA,      this);
+
+    // 2) epoll для событий
     epfd_ = epoll_create1(0);
     if (epfd_ < 0) {
-        Logger::warn("Worker: epoll_create1 failed: %s", std::strerror(errno));
+        Logger::warn("Worker: epoll_create1 failed: %s", strerror(errno));
+        int stillRunning = 0;
+        curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &stillRunning);
         curl_multi_cleanup(multi_);
         return;
     }
 
-    // 3) стартовый «пул» запросов
+    // 3) Стартовый пул запросов
     for (size_t i = 0; i < initialRequests_ && nextIndex_ < urls_.size(); ++i) {
         addHandle(nextIndex_++);
     }
 
-    // 4) запускаем первый вызов, чтобы зарегать timeout = 0
+    // 4) Первый вызов для регистрации таймера = 0
     int stillRunning = 0;
     curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &stillRunning);
 
-    // 5) основной event loop
+    // 5) Event loop
     while (stillRunning > 0) {
-        int timeout = timer_ms_ >= 0 ? (int)timer_ms_ : 1000;
+        int timeout = timer_ms_ >= 0 ? int(timer_ms_) : 1000;
         epoll_event events[16];
         int n = epoll_wait(epfd_, events, 16, timeout);
         if (n < 0) {
             if (errno == EINTR) continue;
-            Logger::warn("Worker: epoll_wait error: %s", std::strerror(errno));
+            Logger::warn("Worker: epoll_wait error: %s", strerror(errno));
             break;
         }
 
         if (n == 0) {
-            // таймаут по таймеру
             curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &stillRunning);
         } else {
             for (int i = 0; i < n; ++i) {
@@ -179,67 +195,96 @@ void Worker::operator()() {
             }
         }
 
-        // 6) вытаскиваем завершённые easy
+        // 6) Обработка завершившихся easy
         while (true) {
-            int msgsInQueue = 0;
-            CURLMsg* msg = curl_multi_info_read(multi_, &msgsInQueue);
+            int msgs;
+            CURLMsg* msg = curl_multi_info_read(multi_, &msgs);
             if (!msg) break;
-            if (msg->msg == CURLMSG_DONE) {
-                CURL* easy = msg->easy_handle;
-                auto itCtx = ctxMap_.find(easy);
-                if (itCtx != ctxMap_.end()) {
-                    EasyContext* ctx = itCtx->second;
-                    curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &ctx->statusCode);
+            if (msg->msg != CURLMSG_DONE) continue;
 
-                    // ищем совпадения по ключевым словам
-                    bool found = false;
-                    for (auto& kw : keywords_) {
-                        if (ctx->html.find(kw) != std::string::npos) {
-                            found = true;
-                            break;
-                        }
-                    }
+            CURL* easy = msg->easy_handle;
+            auto it = ctxMap_.find(easy);
+            if (it == ctxMap_.end()) {
+                safeRemove(easy);
+                continue;
+            }
 
-                    char* eff_url = nullptr;
-                    curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &eff_url);
-                    CURLcode res = msg->data.result;
+            auto* ctx = it->second;
+            curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &ctx->statusCode);
 
-                    Logger::debug(
-                        "DONE: [%ld] %s (CURLcode=%d, found=%s, eff_url=%s)",
-                        ctx->statusCode,
-                        ctx->url.c_str(),
-                        (int)res,
-                        (found ? "yes" : "no"),
-                        eff_url ? eff_url : "(null)",
-                        curl_easy_strerror(res)
-                    );
-
-                    // ==== ЗАПИСЬ НА ЛЕТУ ====
-                    if (ctx->statusCode == 200 && (keywords_.empty() || found)) {
-                        std::string u = ctx->url;
-                        if (auto p = u.find("://"); p != std::string::npos)
-                            u.erase(0, p + 3);
-                        {
-                            std::lock_guard<std::mutex> lock(*fileMutex_);
-                            std::fprintf(outfp_, "%s\n", u.c_str());
-                            std::fflush(outfp_); // Пишем сразу
-                        }
-                        if (matched_) (*matched_)++;
-                    }
-
-                    delete ctx;
-                    ctxMap_.erase(itCtx);
+            bool allFound = true;
+            for (auto& kw : keywords_) {
+                if (ctx->html.find(kw) == std::string::npos) {
+                    allFound = false;
+                    break;
                 }
-                removeHandle(easy);
+            }
 
-                // запускаем следующий URL, если он остался
-                if (nextIndex_ < urls_.size()) {
-                    addHandle(nextIndex_++);
+            char* eff = nullptr;
+            curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &eff);
+            Logger::debug(
+                "DONE: [%ld] %s (CURLcode=%d, allFound=%s, eff_url=%s)",
+                ctx->statusCode,
+                ctx->url.c_str(),
+                (int)msg->data.result,
+                allFound ? "yes" : "no",
+                eff ? eff : "(null)"
+            );
+
+            // Пишем только подходящие (в файл, с мьютексом)
+            if (ctx->statusCode == 200 && (keywords_.empty() || allFound)) {
+                std::string u = ctx->url;
+                if (auto p = u.find("://"); p != std::string::npos)
+                    u.erase(0, p + 3);
+                {
+                    std::lock_guard<std::mutex> lock(*fileMutex_);
+                    std::fprintf(outfp_, "%s\n", u.c_str());
+                    std::fflush(outfp_);
                 }
+                if (matched_) (*matched_)++;
+            }
+
+            safeRemove(easy);
+
+            if (nextIndex_ < urls_.size()) {
+                addHandle(nextIndex_++);
             }
         }
     }
 
-    close(epfd_);
-    curl_multi_cleanup(multi_);
+    // 7) Финальная «продувка» libcurl
+    {
+        int msgs_left = 0;
+        curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &stillRunning);
+        while (CURLMsg* msg = curl_multi_info_read(multi_, &msgs_left)) {
+            if (msg->msg == CURLMSG_DONE) {
+                safeRemove(msg->easy_handle);
+            }
+        }
+    }
+
+    // 8) Очистка оставшихся handle
+    if (!ctxMap_.empty()) {
+        Logger::warn("Worker: %zu handle(s) left in ctxMap_, cleaning up", ctxMap_.size());
+    }
+
+    for (auto& kv : ctxMap_) {
+        CURL* easy = kv.first;
+        EasyContext* ctx = kv.second;
+        curl_multi_remove_handle(multi_, easy);
+        curl_easy_cleanup(easy);
+        delete ctx;
+    }
+    ctxMap_.clear();
+
+    // 9) Очистка multi и epoll
+    if (multi_) {
+        curl_multi_cleanup(multi_);
+        multi_ = nullptr;
+    }
+
+    if (epfd_ >= 0) {
+        close(epfd_);
+        epfd_ = -1;
+    }
 }

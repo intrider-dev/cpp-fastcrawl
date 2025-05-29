@@ -14,7 +14,7 @@ struct EasyContext {
     std::string url;
     std::string html;
     long statusCode = 0;
-    char* curlErr = nullptr;
+    char errbuf[CURL_ERROR_SIZE] = { 0 };  // встроенный буфер
 };
 
 struct Args {
