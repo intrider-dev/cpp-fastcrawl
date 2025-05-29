@@ -1,43 +1,26 @@
-// src/HttpClient.hpp
-#ifndef HTTPCLIENT_HPP
-#define HTTPCLIENT_HPP
+#pragma once
 
-#include <string>
+#include "Worker.hpp"
 #include <vector>
-#include <curl/curl.h>
-
-struct HttpResponse {
-    std::string url;
-    std::string headers;
-    std::string body;
-    long        code = 0; // HTTP response code (например, 200, 404, 301, ...), по умолчанию 0
-};
+#include <string>
+#include <mutex>
+#include <atomic>
+#include <cstdio>
 
 class HttpClient {
 public:
-    HttpClient();
+    HttpClient(size_t threadCount, size_t initialRequestsPerThread,
+               FILE* outfp, std::mutex* fileMutex, std::atomic<size_t>* matched);
     ~HttpClient();
 
-    // Синхронная загрузка (обычно используется для отладки)
-    bool fetch(const std::string& url, std::string& responseBody);
-
-    // Синхронная загрузка в файл
-    bool fetchToFile(const std::string& url, FILE* outfp);
-
-    // Асинхронная загрузка одного URL (на самом деле делает запрос в фоне через curl_multi)
-    bool fetchAsync(const std::string& url, std::string& responseBody);
-
-    // Множественная асинхронная загрузка (гарантирует возврат даже при ошибках)
-    std::vector<HttpResponse> fetchMulti(const std::vector<std::string>& urls);
-
-    // Позволяет использовать writeCallback как нестатическую функцию (опционально)
-    static size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata);
-
-    // Позволяет использовать headerCallback как нестатическую функцию (опционально)
-    static size_t headerCallback(char* ptr, size_t size, size_t nmemb, void* userdata);
+    // Теперь ничего не возвращает: всё пишется сразу, счётчик matched обновляется на лету.
+    void fetchAll(const std::vector<std::string>& urls,
+                  const std::vector<std::string>& keywords);
 
 private:
-    CURL* curlHandle = nullptr; // Используется только для одиночных fetch
+    size_t threadCount_;
+    size_t initialRequestsPerThread_;
+    FILE* outfp_;
+    std::mutex* fileMutex_;
+    std::atomic<size_t>* matched_;
 };
-
-#endif // HTTPCLIENT_HPP

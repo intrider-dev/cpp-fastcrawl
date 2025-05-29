@@ -1,22 +1,18 @@
-// src/DomainLoader.hpp
-#ifndef DOMAINLOADER_HPP
-#define DOMAINLOADER_HPP
-
+#pragma once
 #include <string>
+#include <vector>
 #include <thread>
 
 class DomainLoader {
 public:
-    DomainLoader(const std::string& filename);
-    ~DomainLoader();
-
+    explicit DomainLoader(const std::string& filename);
     void start();
     void join();
+    std::vector<std::string> getDomains() const;
 
 private:
-    void run();
-    std::thread loaderThread;
-    std::string filename;
+    std::string filename_;
+    std::vector<std::string> domains_;
+    std::thread loaderThread_;
+    void loaderFunc();
 };
-
-#endif // DOMAINLOADER_HPP

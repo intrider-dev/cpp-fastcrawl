@@ -1,42 +1,57 @@
-// src/Logger.cpp
 #include "Logger.hpp"
+#include <cstdio>
 
-Logger::Level Logger::currentLevel = Logger::Level::Info;
-std::mutex    Logger::mtx;
+Logger::Level Logger::s_level = Logger::Level::Info;
+std::mutex    Logger::s_mutex;
+FILE* Logger::s_fp = nullptr;
 
-void Logger::init(Level level) {
-    currentLevel = level;
+void Logger::init(Level lvl) {
+    s_level = lvl;
 }
 
-void Logger::log(Level msgLevel, const char* fmt, va_list args) {
-    if (msgLevel <= currentLevel) {
-        std::lock_guard<std::mutex> lock(mtx);
-        const char* lvl = (msgLevel == Level::Error ? "ERROR" :
-                           msgLevel == Level::Info  ? "INFO"  :
-                                                      "DEBUG");
-        std::time_t t = std::time(nullptr);
-        char tb[20];
-        std::strftime(tb, sizeof(tb), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
-        std::fprintf(stderr, "%s [%s] ", tb, lvl);
-        std::vfprintf(stderr, fmt, args);
-        std::fprintf(stderr, "\n");
-    }
+void Logger::setFile(FILE* fp) {
+    std::lock_guard<std::mutex> lk(s_mutex);
+    s_fp = fp;
+}
+
+bool Logger::isDebug() {
+    return s_level == Level::Debug;
 }
 
 void Logger::error(const char* fmt, ...) {
+    if (s_level < Level::Error) return;
     va_list ap; va_start(ap, fmt);
     log(Level::Error, fmt, ap);
     va_end(ap);
 }
 
+void Logger::warn(const char* fmt, ...) {
+    if (s_level < Level::Warn) return;
+    va_list ap; va_start(ap, fmt);
+    log(Level::Warn, fmt, ap);
+    va_end(ap);
+}
+
 void Logger::info(const char* fmt, ...) {
+    if (s_level < Level::Info) return;
     va_list ap; va_start(ap, fmt);
     log(Level::Info, fmt, ap);
     va_end(ap);
 }
 
 void Logger::debug(const char* fmt, ...) {
+    if (s_level < Level::Debug) return;
     va_list ap; va_start(ap, fmt);
     log(Level::Debug, fmt, ap);
     va_end(ap);
+}
+
+void Logger::log(Level lvl, const char* fmt, va_list ap) {
+    static const char* names[] = { "ERROR","WARN","INFO","DEBUG" };
+    std::lock_guard<std::mutex> lk(s_mutex);
+    FILE* fp = s_fp ? s_fp : stderr;
+    std::fprintf(fp, "[%s] ", names[int(lvl)]);
+    std::vfprintf(fp, fmt, ap);
+    std::fprintf(fp, "\n");
+    std::fflush(fp);
 }

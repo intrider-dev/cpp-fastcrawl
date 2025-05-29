@@ -1,36 +1,35 @@
-// src/DomainLoader.cpp
 #include "DomainLoader.hpp"
-#include "Worker.hpp"
-#include "Logger.hpp"
 #include <fstream>
-#include <string>
+#include <algorithm>
+#include <cctype>
 
-DomainLoader::DomainLoader(const std::string& fn)
-    : filename(fn)
+DomainLoader::DomainLoader(const std::string& filename)
+    : filename_(filename)
 {}
 
-DomainLoader::~DomainLoader() {}
-
 void DomainLoader::start() {
-    loaderThread = std::thread(&DomainLoader::run, this);
+    loaderThread_ = std::thread(&DomainLoader::loaderFunc, this);
 }
 
 void DomainLoader::join() {
-    if (loaderThread.joinable())
-        loaderThread.join();
+    if (loaderThread_.joinable())
+        loaderThread_.join();
 }
 
-void DomainLoader::run() {
-    std::ifstream in(filename);
-    if (!in) {
-        Logger::error("Failed to open domain file: %s", filename.c_str());
-        Worker::notifyFinished();
-        return;
-    }
+std::vector<std::string> DomainLoader::getDomains() const {
+    return domains_;
+}
+
+void DomainLoader::loaderFunc() {
+    std::ifstream infile(filename_);
     std::string line;
-    while (std::getline(in, line)) {
-        if (!line.empty())
-            Worker::enqueueDomain(line);
+    while (std::getline(infile, line)) {
+        // Обрезаем пробелы и спецсимволы
+        line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char c) {
+            return std::isspace(c) || c == '\r' || c == '\n';
+        }), line.end());
+        if (!line.empty()) {
+            domains_.push_back(line);
+        }
     }
-    Worker::notifyFinished();
 }
