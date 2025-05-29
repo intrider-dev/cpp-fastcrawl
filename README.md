@@ -1,6 +1,6 @@
 # CPP-FastCrawl
 
-CPP-FastCrawl is a high-performance, multithreaded C++ crawler designed to scan massive lists of websites and detect specified keywords. It is built for speed, efficiency, and low memory usage, using libcurl's multi interface and Linux epoll.
+CPP-FastCrawl is a high-performance, multithreaded C++ crawler designed to scan massive lists of websites and detect specified keywords. It is built for speed, efficiency, and low memory usage, using libcurl's multi interface and Linux epoll (in epoll version).
 
 ## Features
 
