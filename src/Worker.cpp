@@ -3,6 +3,7 @@
 #include "HttpClient.hpp"
 #include "Logger.hpp"
 #include <algorithm>
+#include <cctype>
 
 std::queue<std::string>  Worker::domainQueue;
 bool                     Worker::loadingDone = false;
@@ -48,9 +49,6 @@ void Worker::setMatchWords(const std::vector<std::string>& words) {
 }
 
 void Worker::operator()() {
-    HttpClient client;
-    std::string domain;
-
     static std::once_flag onceFlag;
     std::call_once(onceFlag, []() {
         Logger::debug("Worker: searching for words:");
@@ -59,52 +57,81 @@ void Worker::operator()() {
         }
     });
 
+    HttpClient client;
+    const int batchSize = 5;  // Можно увеличить при необходимости
+
     while (true) {
+        std::vector<std::string> batchDomains;
         {
             std::unique_lock<std::mutex> lock(queueMutex);
             condVar.wait(lock, [] {
                 return !domainQueue.empty() || loadingDone;
             });
+
             if (domainQueue.empty() && loadingDone)
                 break;
-            domain = std::move(domainQueue.front());
-            domainQueue.pop();
-        }
 
-        domain.erase(std::remove(domain.begin(), domain.end(), '\r'), domain.end());
-        domain.erase(std::remove(domain.begin(), domain.end(), '\n'), domain.end());
-        std::string full_url = domain; // "https://" + domain;
+            for (int i = 0; i < batchSize && !domainQueue.empty(); ++i) {
+                std::string domain = std::move(domainQueue.front());
+                domainQueue.pop();
 
-        std::string body;
-        bool ok = client.fetch(full_url, body);
-        Logger::debug("Body length for %s (--> %zu <--)", domain.c_str(), body.size());
-        if (!ok) {
-            Logger::error("Worker: failed fetching %s", domain.c_str());
-        } else {
-            Logger::debug("Worker: fetched and saved %s", domain.c_str());
-        }
+                domain.erase(std::remove(domain.begin(), domain.end(), '\r'), domain.end());
+                domain.erase(std::remove(domain.begin(), domain.end(), '\n'), domain.end());
 
-        std::string body_lower = body;
-        std::transform(body_lower.begin(), body_lower.end(), body_lower.begin(), ::tolower);
-
-        bool matched = true;  // предполагаем, что все слова есть
-        for (const auto& word : matchWords) {
-            std::string word_lower = word;
-            std::transform(word_lower.begin(), word_lower.end(), word_lower.begin(), ::tolower);
-
-            if (body_lower.find(word_lower) == std::string::npos) {
-                matched = false;  // если хоть одно слово не найдено, ставим false
-                break;
+                batchDomains.push_back(std::move(domain));
             }
         }
 
-        if (matched) {
-            std::lock_guard<std::mutex> lock(outputMutex);
-            std::fprintf(outputFile, "%s\n", domain.c_str());
-            std::fflush(outputFile);
-            Logger::debug("Worker: matched all words in domain %s", domain.c_str());
-        } else {
-            Logger::debug("Worker: not matched %s", domain.c_str());
+        if (batchDomains.empty())
+            continue;
+
+        // Добавляем протокол, если его нет
+        std::vector<std::string> urlsWithProtocol;
+        urlsWithProtocol.reserve(batchDomains.size());
+        for (const auto& domain : batchDomains) {
+            if (domain.find("://") == std::string::npos) {
+                urlsWithProtocol.push_back("http://" + domain);
+            } else {
+                urlsWithProtocol.push_back(domain);
+            }
+        }
+
+        // Получаем результаты пачкой из HttpClient (параллельно)
+        auto results = client.fetchMulti(urlsWithProtocol);
+
+        // results: std::vector<HttpResponse>
+        for (const auto& resp : results) {
+            // Убираем протокол из URL для вывода
+            std::string domain = resp.url;
+            auto pos = domain.find("://");
+            if (pos != std::string::npos) {
+                domain = domain.substr(pos + 3);
+            }
+
+            Logger::debug("Body length for %s (--> %zu <--)", domain.c_str(), resp.body.size());
+            std::string body_lower = resp.body;
+            std::transform(body_lower.begin(), body_lower.end(), body_lower.begin(), ::tolower);
+
+            bool matched = true;
+            for (const auto& word : matchWords) {
+                std::string word_lower = word;
+                std::transform(word_lower.begin(), word_lower.end(), word_lower.begin(), ::tolower);
+                if (body_lower.find(word_lower) == std::string::npos) {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if (matched) {
+                std::lock_guard<std::mutex> lock(outputMutex);
+                if (outputFile) {
+                    std::fprintf(outputFile, "%s\n", domain.c_str());
+                    std::fflush(outputFile);
+                }
+                Logger::debug("Worker: matched all words in domain %s", domain.c_str());
+            } else {
+                Logger::debug("Worker: not matched %s", domain.c_str());
+            }
         }
     }
 }
