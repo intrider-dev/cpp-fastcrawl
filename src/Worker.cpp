@@ -72,8 +72,11 @@ void Worker::operator()() {
         curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT,10L);
         curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, 3L);
         curl_easy_setopt(easy, CURLOPT_NOSIGNAL,       1L);
+        curl_easy_setopt(easy, CURLOPT_BUFFERSIZE,     32768L);
         curl_easy_setopt(easy, CURLOPT_HTTP_VERSION,   CURL_HTTP_VERSION_2TLS);
         curl_easy_setopt(easy, CURLOPT_PIPEWAIT,       1L);
+        curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 0L);
         if (g_shareHandle)
             curl_easy_setopt(easy, CURLOPT_SHARE, g_shareHandle);
 
