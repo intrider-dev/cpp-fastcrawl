@@ -9,9 +9,14 @@
 
 class HttpClient {
 public:
-    HttpClient(size_t threadCount, size_t initialRequestsPerThread,
-               FILE* outfp, std::mutex* fileMutex, std::atomic<size_t>* matched);
+    HttpClient(size_t threadCount,
+                size_t initialRequestsPerThread,
+                FILE* outfp, std::mutex* fileMutex,
+                std::atomic<size_t>* matched,
+                std::atomic<size_t>* resumeIndex);
     ~HttpClient();
+    void setResumeIndex(size_t index);
+    void setCheckpointFile(const std::string& path);
 
     // Теперь ничего не возвращает: всё пишется сразу, счётчик matched обновляется на лету.
     void fetchAll(const std::vector<std::string>& urls,
@@ -23,4 +28,6 @@ private:
     FILE* outfp_;
     std::mutex* fileMutex_;
     std::atomic<size_t>* matched_;
+    std::atomic<size_t>* resumeIndex_;  // <= изменено с size_t на std::atomic<size_t>*
+    std::string checkpointFile_;
 };

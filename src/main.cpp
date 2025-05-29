@@ -11,6 +11,11 @@
 #include <algorithm>
 #include <mutex>
 #include <atomic>
+#include <fstream>
+#include <sstream>
+#include <openssl/sha.h>
+#include <thread>
+#include <chrono>
 
 static std::vector<std::string> splitCommaList(const std::string& v) {
     std::vector<std::string> result;
@@ -59,6 +64,23 @@ static std::vector<std::string> buildUrlVariants(const std::string& d) {
         return { "https://" + d, "http://" + d };
 }
 
+static std::string hashFilePath(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return "";
+    std::ostringstream oss;
+    oss << file.rdbuf();
+    std::string content = oss.str();
+
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(content.data()), content.size(), hash);
+
+    std::ostringstream hashStr;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        hashStr << std::hex << (int)hash[i];
+    }
+    return hashStr.str();
+}
+
 int main(int argc, char* argv[]) {
     Args args;
     std::string logfile;
@@ -76,9 +98,22 @@ int main(int argc, char* argv[]) {
 
     Logger::init(args.debug ? Logger::Level::Debug : Logger::Level::Info);
 
+    // 1) вычисляем хеш и ищем state-файл
+    std::string hash = hashFilePath(args.input);
+    std::string stateFile = "state-" + hash + ".txt";
+    std::atomic<size_t> resumeIndex { 0 };
+    {
+        size_t tmpIndex;
+        std::ifstream in(stateFile);
+        if (in >> tmpIndex) {
+            resumeIndex.store(tmpIndex);
+            Logger::info("Resuming from checkpoint %s (index %zu)", stateFile.c_str(), tmpIndex);
+        }
+    }
+
     FILE* logfp = nullptr;
     if (!logfile.empty()) {
-        logfp = std::fopen(logfile.c_str(), "w");
+        logfp = std::fopen(logfile.c_str(), resumeIndex > 0 ? "a" : "w");
         if (!logfp) {
             std::fprintf(stderr, "Cannot open logfile: %s\n", logfile.c_str());
             return 1;
@@ -86,7 +121,7 @@ int main(int argc, char* argv[]) {
         Logger::setFile(logfp);
     }
 
-    // 1) load domains
+    // 2) load domains
     DomainLoader loader(args.input);
     loader.start(); loader.join();
     auto domains = loader.getDomains();
@@ -96,7 +131,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 2) build URLs
+    // 3) build URLs
     std::vector<std::string> urls;
     urls.reserve(domains.size()*2);
     for (auto& d : domains) {
@@ -104,8 +139,8 @@ int main(int argc, char* argv[]) {
         urls.insert(urls.end(), v.begin(), v.end());
     }
 
-    // 3) open output file and prepare shared objects
-    FILE* outfp = std::fopen(args.output.c_str(), "w");
+    // 4) open output file and prepare shared objects
+    FILE* outfp = std::fopen(args.output.c_str(), resumeIndex > 0 ? "a" : "w");
     if (!outfp) {
         Logger::error("Cannot open %s", args.output.c_str());
         if (logfp) std::fclose(logfp);
@@ -114,15 +149,34 @@ int main(int argc, char* argv[]) {
     std::mutex fileMutex;
     std::atomic<size_t> matched{0};
 
-    // 4) run crawl with streaming output
+    // 5) run crawl with streaming output
     HttpClient client(
         (size_t)args.threads,
-        100,         // initial requests per thread
+        100,
         outfp,
         &fileMutex,
-        &matched
+        &matched,
+        &resumeIndex
     );
+    client.setResumeIndex(resumeIndex);
+    client.setCheckpointFile(stateFile);
+
+    // запускаем фоновую задачу для обновления state на лету
+    std::atomic<bool> stopFlag{false};
+    std::thread checkpointThread([&]() {
+        while (!stopFlag.load()) {
+            {
+                std::ofstream out(stateFile, std::ios::trunc);
+                out << resumeIndex << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+    });
+
     client.fetchAll(urls, args.contains);
+
+    stopFlag = true;
+    checkpointThread.join();
 
     std::fclose(outfp);
     Logger::info("Total matched: %zu", matched.load());

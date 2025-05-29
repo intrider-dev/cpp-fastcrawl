@@ -5,6 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <curl/curl.h>
 #include <sys/epoll.h>
 #include "CommonTypes.hpp"
@@ -12,9 +13,10 @@
 class Worker {
     FILE* outfp_;
     std::mutex* fileMutex_;
+    std::unordered_set<CURL*> removedHandles_;
 public:
     Worker(const std::vector<std::string>& urls,
-       std::atomic<size_t>& nextIndex,
+       std::atomic<size_t>* nextIndex,
        const std::vector<std::string>& keywords,
        size_t initialRequests,
        FILE* outfp,
@@ -23,6 +25,8 @@ public:
 
     // Entry point для std::thread
     void operator()();
+
+    void setResumeIndexPtr(std::atomic<size_t>* ptr);
 
     // Результаты после завершения
     const std::vector<HttpResponse>& getResults() const { return results_; }
@@ -41,10 +45,12 @@ private:
 
     // Данные, переданные из HttpClient
     const std::vector<std::string>& urls_;
-    std::atomic<size_t>&            nextIndex_;
+    std::atomic<size_t>* nextIndex_;
     const std::vector<std::string>& keywords_;
     size_t                          initialRequests_;
     std::atomic<size_t>* matched_;
+
+    std::atomic<size_t>* resumeIndex_ = nullptr;
 
     // curl-multi, epoll и связанные мапы
     CURLM*                                       multi_;

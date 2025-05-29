@@ -10,17 +10,18 @@
 #include <map>
 #include <sstream>
 #include <cassert>
+#include <unordered_set>
 
 // Конструктор
 Worker::Worker(const std::vector<std::string>& urls,
-               std::atomic<size_t>& nextIndex,
+               std::atomic<size_t>* nextIndex,
                const std::vector<std::string>& keywords,
                size_t initialRequests,
                FILE* outfp,
                std::mutex* fileMutex,
                std::atomic<size_t>* matched)
     : urls_(urls),
-      nextIndex_(nextIndex),
+      nextIndex_(nextIndex),  // указатель
       keywords_(keywords),
       initialRequests_(initialRequests),
       multi_(nullptr),
@@ -106,15 +107,22 @@ void Worker::addHandle(size_t idx) {
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(easy, CURLOPT_TIMEOUT,        60L);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 15L);
-    curl_easy_setopt(easy, CURLOPT_NOSIGNAL,       1L); // fix: должно быть 1L (булево!)
+    curl_easy_setopt(easy, CURLOPT_NOSIGNAL,       1L);
     if (g_shareHandle)
         curl_easy_setopt(easy, CURLOPT_SHARE, g_shareHandle);
 
     curl_multi_add_handle(multi_, easy);
 }
 
-// Безопасно удалить easy-handle (гарантирует отсутствие double-free)
+void Worker::setResumeIndexPtr(std::atomic<size_t>* ptr) {
+    resumeIndex_ = ptr;
+}
+
+// Безопасно удалить easy-handle
 void Worker::safeRemove(CURL* easy) {
+    if (!easy || removedHandles_.count(easy)) return;
+
+    removedHandles_.insert(easy);
     curl_multi_remove_handle(multi_, easy);
 
     auto it = ctxMap_.find(easy);
@@ -126,7 +134,7 @@ void Worker::safeRemove(CURL* easy) {
     curl_easy_cleanup(easy);
 }
 
-// Главный оператор — выполняется в потоке
+// Главный оператор потока
 void Worker::operator()() {
     initCurlShare();
 
@@ -141,20 +149,18 @@ void Worker::operator()() {
         Logger::debug("%s", oss.str().c_str());
     }
 
-    // 1) Инициализация multi
     multi_ = curl_multi_init();
     if (!multi_) {
         Logger::warn("Worker: curl_multi_init failed");
         return;
     }
 
-    curl_multi_setopt(multi_, CURLMOPT_PIPELINING,     CURLPIPE_MULTIPLEX);
+    curl_multi_setopt(multi_, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
     curl_multi_setopt(multi_, CURLMOPT_SOCKETFUNCTION, curlSocketCallback);
-    curl_multi_setopt(multi_, CURLMOPT_SOCKETDATA,     this);
-    curl_multi_setopt(multi_, CURLMOPT_TIMERFUNCTION,  timerCb);
-    curl_multi_setopt(multi_, CURLMOPT_TIMERDATA,      this);
+    curl_multi_setopt(multi_, CURLMOPT_SOCKETDATA, this);
+    curl_multi_setopt(multi_, CURLMOPT_TIMERFUNCTION, timerCb);
+    curl_multi_setopt(multi_, CURLMOPT_TIMERDATA, this);
 
-    // 2) epoll для событий
     epfd_ = epoll_create1(0);
     if (epfd_ < 0) {
         Logger::warn("Worker: epoll_create1 failed: %s", strerror(errno));
@@ -164,16 +170,15 @@ void Worker::operator()() {
         return;
     }
 
-    // 3) Стартовый пул запросов
-    for (size_t i = 0; i < initialRequests_ && nextIndex_ < urls_.size(); ++i) {
-        addHandle(nextIndex_++);
+    for (size_t i = 0; i < initialRequests_ && nextIndex_->load() < urls_.size(); ++i) {
+        size_t idx = nextIndex_->fetch_add(1);
+        addHandle(idx);
+        if (resumeIndex_) resumeIndex_->store(idx);
     }
 
-    // 4) Первый вызов для регистрации таймера = 0
     int stillRunning = 0;
     curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &stillRunning);
 
-    // 5) Event loop
     while (stillRunning > 0) {
         int timeout = timer_ms_ >= 0 ? int(timer_ms_) : 1000;
         epoll_event events[16];
@@ -195,7 +200,6 @@ void Worker::operator()() {
             }
         }
 
-        // 6) Обработка завершившихся easy
         while (true) {
             int msgs;
             CURLMsg* msg = curl_multi_info_read(multi_, &msgs);
@@ -231,7 +235,6 @@ void Worker::operator()() {
                 eff ? eff : "(null)"
             );
 
-            // Пишем только подходящие (в файл, с мьютексом)
             if (ctx->statusCode == 200 && (keywords_.empty() || allFound)) {
                 std::string u = ctx->url;
                 if (auto p = u.find("://"); p != std::string::npos)
@@ -246,13 +249,14 @@ void Worker::operator()() {
 
             safeRemove(easy);
 
-            if (nextIndex_ < urls_.size()) {
-                addHandle(nextIndex_++);
+            if (nextIndex_->load() < urls_.size()) {
+                size_t idx = nextIndex_->fetch_add(1);
+                addHandle(idx);
+                if (resumeIndex_) resumeIndex_->store(idx);
             }
         }
     }
 
-    // 7) Финальная «продувка» libcurl
     {
         int msgs_left = 0;
         curl_multi_socket_action(multi_, CURL_SOCKET_TIMEOUT, 0, &stillRunning);
@@ -263,21 +267,17 @@ void Worker::operator()() {
         }
     }
 
-    // 8) Очистка оставшихся handle
-    if (!ctxMap_.empty()) {
-        Logger::warn("Worker: %zu handle(s) left in ctxMap_, cleaning up", ctxMap_.size());
-    }
-
     for (auto& kv : ctxMap_) {
         CURL* easy = kv.first;
         EasyContext* ctx = kv.second;
-        curl_multi_remove_handle(multi_, easy);
-        curl_easy_cleanup(easy);
+        if (!removedHandles_.count(easy)) {
+            curl_multi_remove_handle(multi_, easy);
+            curl_easy_cleanup(easy);
+        }
         delete ctx;
     }
     ctxMap_.clear();
 
-    // 9) Очистка multi и epoll
     if (multi_) {
         curl_multi_cleanup(multi_);
         multi_ = nullptr;

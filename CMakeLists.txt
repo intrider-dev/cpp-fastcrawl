@@ -1,27 +1,23 @@
 cmake_minimum_required(VERSION 3.12)
 project(HighPerfCrawler LANGUAGES CXX)
 
-# Путь к пользовательским модулям CMake (например, FindLibCurl.cmake)
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/CMakeModules")
-
-# Установка стандарта C++
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Поиск библиотеки libcurl (если не найдена системная, используется FindLibCurl.cmake)
+# Путь к пользовательским модулям CMake
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/CMakeModules")
+
 find_package(CURL REQUIRED)
-
-# Потоки (на Linux подключает pthread, на Windows — ничего)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 
-# Опционально: добавить флаг компиляции для включения отладочной информации
 option(ENABLE_DEBUG "Enable debug logging" OFF)
 if(ENABLE_DEBUG)
     add_compile_definitions(DEBUG_MODE)
 endif()
 
-# Исполняемый файл и исходники
+# Основной исполняемый файл
 add_executable(${PROJECT_NAME}
         src/main.cpp
         src/DomainLoader.cpp
@@ -31,20 +27,25 @@ add_executable(${PROJECT_NAME}
         src/CurlShare.cpp
 )
 
-# Подключаемые директории с заголовками
 target_include_directories(${PROJECT_NAME}
         PRIVATE
         ${CURL_INCLUDE_DIRS}
         ${CMAKE_SOURCE_DIR}/src
 )
 
-# Линковка с нужными библиотеками
 target_link_libraries(${PROJECT_NAME}
         PRIVATE
         CURL::libcurl
         Threads::Threads
+        OpenSSL::Crypto
 )
 
-# Для отладки — вывод путей к curl
+# Отладочный вывод путей
 message(STATUS "CURL include dirs: ${CURL_INCLUDE_DIRS}")
 message(STATUS "CURL libraries: ${CURL_LIBRARIES}")
+
+# Дополнительный исполняемый файл: launcher
+add_executable(launcher src/main_launcher.cpp)
+
+# Он не зависит от libcurl/OpenSSL и не ссылается на основную логику
+target_link_libraries(launcher PRIVATE Threads::Threads)
