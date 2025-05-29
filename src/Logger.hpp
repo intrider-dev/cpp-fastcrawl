@@ -1,26 +1,26 @@
-// src/Logger.hpp
-#ifndef LOGGER_HPP
-#define LOGGER_HPP
-
-#include <string>
+#pragma once
 #include <mutex>
 #include <cstdarg>
-#include <cstdio>
-#include <ctime>
 
 class Logger {
 public:
-    enum class Level { Error = 0, Info = 1, Debug = 2 };
+    enum class Level { Error=0, Warn, Info, Debug };
 
-    static void init(Level level = Level::Info);
+    // Инициализируем единожды в main()
+    static void init(Level lvl);
+
+    // Проверка уровня
+    static bool isDebug();
+
+    // Основные методы
     static void error(const char* fmt, ...);
+    static void warn (const char* fmt, ...);
     static void info (const char* fmt, ...);
     static void debug(const char* fmt, ...);
 
 private:
-    static Level    currentLevel;
-    static std::mutex mtx;
-    static void     log(Level msgLevel, const char* fmt, va_list args);
-};
+    static void log(Level lvl, const char* fmt, va_list ap);
 
-#endif // LOGGER_HPP
+    static Level      s_level;
+    static std::mutex s_mutex;
+};

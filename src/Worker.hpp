@@ -1,35 +1,35 @@
-// src/Worker.hpp
-#ifndef WORKER_HPP
-#define WORKER_HPP
-
-#include <string>
-#include <queue>
-#include <mutex>
-#include <thread>
+// Worker.hpp
+#pragma once
 #include <vector>
-#include <condition_variable>
+#include <atomic>
+#include <string>
+#include <mutex>
+#include <cstdio>
+#include "CommonTypes.hpp"
 
 class Worker {
+    FILE* out_ = nullptr;
+    std::mutex* fileMutex_ = nullptr;
 public:
-    Worker() = default;
+    Worker(const std::vector<std::string>& urls,
+           std::atomic<size_t>& nextIndex,
+           const std::vector<std::string>& keywords,
+           size_t initialRequests,
+           FILE* out = nullptr,
+           std::mutex* fileMutex = nullptr);
+
     void operator()();
 
-    static void startThreads(int count, FILE* outfp);
-    static void enqueueDomain(const std::string& domain);
-    static void notifyFinished();
-    static void joinThreads();
-    static void setMatchWords(const std::vector<std::string>& words);
-
-    static std::mutex outputMutex;
+    const std::vector<HttpResponse>& getResults() const { return results_; }
+    static size_t WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata);
+    static void initCurlShare();
 
 private:
-    static std::queue<std::string> domainQueue;
-    static bool loadingDone;
-    static std::mutex queueMutex;
-    static std::condition_variable condVar;
-    static std::vector<std::thread> threads;
-    static FILE* outputFile;
-    static std::vector<std::string> matchWords;
-};
+    void processFinished(const std::string& url, const std::string& html, long statusCode);
 
-#endif // WORKER_HPP
+    const std::vector<std::string>& urls_;
+    std::atomic<size_t>& nextIndex_;
+    const std::vector<std::string>& keywords_;
+    size_t initialRequests_;
+    std::vector<HttpResponse> results_;
+};

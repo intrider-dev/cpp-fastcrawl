@@ -1,137 +1,179 @@
-// src/Worker.cpp
 #include "Worker.hpp"
-#include "HttpClient.hpp"
+#include "CommonTypes.hpp"
 #include "Logger.hpp"
-#include <algorithm>
-#include <cctype>
+#include <curl/curl.h>
+#include <unordered_map>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
 
-std::queue<std::string>  Worker::domainQueue;
-bool                     Worker::loadingDone = false;
-std::mutex               Worker::queueMutex;
-std::condition_variable  Worker::condVar;
-std::vector<std::thread> Worker::threads;
-FILE*                    Worker::outputFile = nullptr;
-std::mutex               Worker::outputMutex;
-std::vector<std::string> Worker::matchWords;
+// --- глобальный share-handle для DNS кеша ---
+static CURLSH*     g_shareHandle = nullptr;
+static std::once_flag g_shareFlag;
 
-void Worker::startThreads(int count, FILE* outfp) {
-    outputFile = outfp;
-    for (int i = 0; i < count; ++i) {
-        threads.emplace_back(Worker());
-    }
-}
-
-void Worker::enqueueDomain(const std::string& domain) {
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        domainQueue.push(domain);
-    }
-    condVar.notify_one();
-}
-
-void Worker::notifyFinished() {
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        loadingDone = true;
-    }
-    condVar.notify_all();
-}
-
-void Worker::joinThreads() {
-    for (auto& t : threads) {
-        if (t.joinable())
-            t.join();
-    }
-}
-
-void Worker::setMatchWords(const std::vector<std::string>& words) {
-    matchWords = words;
-}
-
-void Worker::operator()() {
-    static std::once_flag onceFlag;
-    std::call_once(onceFlag, []() {
-        Logger::debug("Worker: searching for words:");
-        for (const auto& w : matchWords) {
-            Logger::debug("  - %s", w.c_str());
-        }
+// инициализация DNS-кеша (один раз на процесс)
+void Worker::initCurlShare() {
+    std::call_once(g_shareFlag, [](){
+        g_shareHandle = curl_share_init();
+        if (g_shareHandle)
+            curl_share_setopt(g_shareHandle, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
     });
+}
 
-    HttpClient client;
-    const int batchSize = 5;  // Можно увеличить при необходимости
+// записываем кусок тела в EasyContext.html
+size_t Worker::WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* ctx = static_cast<EasyContext*>(userdata);
+    ctx->html.append(ptr, size * nmemb);
+    return size * nmemb;
+}
 
-    while (true) {
-        std::vector<std::string> batchDomains;
-        {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            condVar.wait(lock, [] {
-                return !domainQueue.empty() || loadingDone;
-            });
+Worker::Worker(const std::vector<std::string>& urls,
+               std::atomic<size_t>& nextIndex,
+               const std::vector<std::string>& keywords,
+               size_t initialRequests,
+               FILE* out,
+               std::mutex* fileMutex)
+    : urls_(urls), nextIndex_(nextIndex), keywords_(keywords),
+      initialRequests_(initialRequests), out_(out), fileMutex_(fileMutex)
+{}
+void Worker::operator()() {
+    // убедимся, что DNS-кеш готов
+    initCurlShare();
 
-            if (domainQueue.empty() && loadingDone)
-                break;
+    // создаём мульти-хэндл
+    CURLM* multi = curl_multi_init();
+    if (!multi) {
+        Logger::warn("Worker: curl_multi_init failed");
+        return;
+    }
+    // рекомендуемые опции
+    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 500000L);
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING,         CURLPIPE_MULTIPLEX);
 
-            for (int i = 0; i < batchSize && !domainQueue.empty(); ++i) {
-                std::string domain = std::move(domainQueue.front());
-                domainQueue.pop();
+    int stillRunning = 0;
+    std::unordered_map<CURL*, EasyContext*> ctxMap;
 
-                domain.erase(std::remove(domain.begin(), domain.end(), '\r'), domain.end());
-                domain.erase(std::remove(domain.begin(), domain.end(), '\n'), domain.end());
+    // лямбда для старта одного запроса
+    auto launch = [&](size_t idx){
+        const auto& url = urls_[idx];
+        CURL* easy = curl_easy_init();
+        if (!easy) {
+            Logger::warn("Worker: curl_easy_init failed for %s", url.c_str());
+            return;
+        }
+        auto* ctx = new EasyContext{url, "", 0L};
 
-                batchDomains.push_back(std::move(domain));
-            }
+        curl_easy_setopt(easy, CURLOPT_URL,            ctx->url.c_str());
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION,  WriteCallback);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA,      ctx);
+        curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, 30L);
+        curl_easy_setopt(easy, CURLOPT_TIMEOUT,        20L);
+        curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT,10L);
+        curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, 3L);
+        curl_easy_setopt(easy, CURLOPT_NOSIGNAL,       1L);
+        curl_easy_setopt(easy, CURLOPT_HTTP_VERSION,   CURL_HTTP_VERSION_2TLS);
+        curl_easy_setopt(easy, CURLOPT_PIPEWAIT,       1L);
+        if (g_shareHandle)
+            curl_easy_setopt(easy, CURLOPT_SHARE, g_shareHandle);
+
+        // буфер для ошибок
+        char* errbuf = (char*)malloc(CURL_ERROR_SIZE);
+        if (errbuf) {
+            errbuf[0] = '\0';
+            curl_easy_setopt(easy, CURLOPT_ERRORBUFFER, errbuf);
         }
 
-        if (batchDomains.empty())
-            continue;
-
-        // Добавляем протокол, если его нет
-        std::vector<std::string> urlsWithProtocol;
-        urlsWithProtocol.reserve(batchDomains.size());
-        for (const auto& domain : batchDomains) {
-            if (domain.find("://") == std::string::npos) {
-                urlsWithProtocol.push_back("http://" + domain);
-            } else {
-                urlsWithProtocol.push_back(domain);
-            }
+        CURLMcode mc = curl_multi_add_handle(multi, easy);
+        if (mc != CURLM_OK) {
+            Logger::warn("Worker: add_handle failed for %s: %s",
+                         url.c_str(), curl_multi_strerror(mc));
+            curl_easy_cleanup(easy);
+            delete ctx;
+            free(errbuf);
+            return;
         }
+        ctxMap[easy] = ctx;
+    };
 
-        // Получаем результаты пачкой из HttpClient (параллельно)
-        auto results = client.fetchMulti(urlsWithProtocol);
+    // стартуем initialRequests_ первых URL
+    for (size_t i = 0; i < initialRequests_; ++i) {
+        size_t idx = nextIndex_++;
+        if (idx >= urls_.size()) break;
+        launch(idx);
+    }
 
-        // results: std::vector<HttpResponse>
-        for (const auto& resp : results) {
-            // Убираем протокол из URL для вывода
-            std::string domain = resp.url;
-            auto pos = domain.find("://");
-            if (pos != std::string::npos) {
-                domain = domain.substr(pos + 3);
+    // запускаем
+    curl_multi_perform(multi, &stillRunning);
+
+    // основной цикл
+    while (stillRunning > 0) {
+        curl_multi_poll(multi, nullptr, 0, 1000, nullptr);
+        curl_multi_perform(multi, &stillRunning);
+
+        int msgsLeft = 0;
+        while (auto* msg = curl_multi_info_read(multi, &msgsLeft)) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            CURL* easy = msg->easy_handle;
+            auto it = ctxMap.find(easy);
+            if (it == ctxMap.end()) {
+                curl_multi_remove_handle(multi, easy);
+                curl_easy_cleanup(easy);
+                continue;
             }
+            auto* ctx = it->second;
+            curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &ctx->statusCode);
 
-            Logger::debug("Body length for %s (--> %zu <--)", domain.c_str(), resp.body.size());
-            std::string body_lower = resp.body;
-            std::transform(body_lower.begin(), body_lower.end(), body_lower.begin(), ::tolower);
+            // обрабатываем
+            processFinished(ctx->url, ctx->html, ctx->statusCode);
 
-            bool matched = true;
-            for (const auto& word : matchWords) {
-                std::string word_lower = word;
-                std::transform(word_lower.begin(), word_lower.end(), word_lower.begin(), ::tolower);
-                if (body_lower.find(word_lower) == std::string::npos) {
-                    matched = false;
-                    break;
-                }
-            }
+            // убираем хэндл
+            curl_multi_remove_handle(multi, easy);
+            curl_easy_cleanup(easy);
+            delete ctx;
+            ctxMap.erase(it);
 
-            if (matched) {
-                std::lock_guard<std::mutex> lock(outputMutex);
-                if (outputFile) {
-                    std::fprintf(outputFile, "%s\n", domain.c_str());
-                    std::fflush(outputFile);
-                }
-                Logger::debug("Worker: matched all words in domain %s", domain.c_str());
-            } else {
-                Logger::debug("Worker: not matched %s", domain.c_str());
-            }
+            // запускаем следующий
+            size_t idx = nextIndex_++;
+            if (idx < urls_.size()) launch(idx);
         }
     }
+
+    // чистим остатки
+    for (auto& kv : ctxMap) {
+        curl_multi_remove_handle(multi, kv.first);
+        curl_easy_cleanup(kv.first);
+        delete kv.second;
+    }
+    curl_multi_cleanup(multi);
 }
+
+void Worker::processFinished(const std::string& url,
+                             const std::string& html,
+                             long statusCode)
+{
+    bool found = false;
+    for (const auto& kw : keywords_) {
+        if (html.find(kw) != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    if (Logger::isDebug()) {
+        Logger::debug("Worker: %s [status=%ld] [%s]",
+                      url.c_str(), statusCode, found ? "match" : "no match");
+    }
+    // Потоковая запись: только если fileMutex_ и out_ заданы
+    if (out_ && fileMutex_ && statusCode == 200 && (keywords_.empty() || found)) {
+        std::string d = url;
+        if (auto p = d.find("://"); p != std::string::npos)
+            d = d.substr(p + 3);
+        std::lock_guard<std::mutex> lock(*fileMutex_);
+        std::fprintf(out_, "%s\n", d.c_str());
+        std::fflush(out_);
+    }
+    // Для статистики (если нужно собрать результаты)
+    HttpResponse resp{url, html, statusCode, found};
+    results_.push_back(std::move(resp));
+}
+
